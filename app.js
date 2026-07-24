@@ -1,8 +1,11 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as SQLite from "expo-sqlite";
 import { useEffect, useMemo, useState } from "react";
 import {
+  ActivityIndicator,
   Alert,
   Modal,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -15,7 +18,18 @@ import {
 } from "react-native";
 
 const storageKey = "agua-rural-state";
+const webCadastroStorageKey = "agua-rural-web-cadastros";
+const cadastroDatabaseName = "agua-rural.db";
+const cadastroTableName = "T000_CADASTROS";
 const monthlyValue = 30;
+const defaultCadastro = {
+  nome: "Lucas",
+  numeroCasa: "01",
+  telefone: "(43) 99858-1293",
+  email: "lucasdircksen26@gmail.com",
+  senha: "2602",
+  tipoUsuario: "admin"
+};
 
 const seedState = {
   usuarios: [
@@ -72,10 +86,122 @@ const nextId = (items) => Math.max(0, ...items.map((item) => item.id)) + 1;
 const money = (value) => Number(value).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 const dateBR = (date) => new Date(`${date}T00:00:00`).toLocaleDateString("pt-BR");
 const monthBR = (month) => new Date(`${month}-01T00:00:00`).toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
+const onlyDigits = (value) => value.replace(/\D/g, "");
+const normalizeHouseNumber = (value) => {
+  const digits = onlyDigits(value);
+  return digits.length === 1 ? `0${digits}` : digits;
+};
+
+const toCadastroRecord = (cadastro) => ({
+  ID: cadastro.id ?? 1,
+  NOME: cadastro.nome,
+  NUMERO_CASA: cadastro.numeroCasa,
+  EMAIL: cadastro.email,
+  TELEFONE: cadastro.telefone,
+  SENHA: cadastro.senha,
+  TIPO_USUARIO: cadastro.tipoUsuario,
+  DATA_CADASTRO: cadastro.dataCadastro ?? new Date().toISOString()
+});
+
+async function setupWebCadastroStorage() {
+  const saved = await AsyncStorage.getItem(webCadastroStorageKey);
+  const cadastros = saved ? JSON.parse(saved) : [];
+  const defaultRecord = toCadastroRecord(defaultCadastro);
+  const existingIndex = cadastros.findIndex((cadastro) => cadastro.NUMERO_CASA === defaultCadastro.numeroCasa);
+
+  if (existingIndex >= 0) {
+    cadastros[existingIndex] = { ...cadastros[existingIndex], ...defaultRecord };
+  } else {
+    cadastros.push(defaultRecord);
+  }
+
+  await AsyncStorage.setItem(webCadastroStorageKey, JSON.stringify(cadastros));
+
+  return {
+    getFirstAsync: async (_query, numeroCasa, senha) => {
+      const current = JSON.parse((await AsyncStorage.getItem(webCadastroStorageKey)) ?? "[]");
+      return current.find((cadastro) => cadastro.NUMERO_CASA === numeroCasa && cadastro.SENHA === senha) ?? null;
+    }
+  };
+}
+
+async function setupCadastroDatabase() {
+  if (Platform.OS === "web") {
+    return setupWebCadastroStorage();
+  }
+
+  const database = await SQLite.openDatabaseAsync(cadastroDatabaseName);
+
+  await database.execAsync(`
+    CREATE TABLE IF NOT EXISTS ${cadastroTableName} (
+      ID INTEGER PRIMARY KEY AUTOINCREMENT,
+      NOME TEXT NOT NULL,
+      NUMERO_CASA TEXT NOT NULL UNIQUE,
+      EMAIL TEXT NOT NULL UNIQUE,
+      TELEFONE TEXT,
+      SENHA TEXT NOT NULL,
+      TIPO_USUARIO TEXT NOT NULL DEFAULT 'morador',
+      DATA_CADASTRO TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  const columns = await database.getAllAsync(`PRAGMA table_info(${cadastroTableName})`);
+  const hasNumeroCasa = columns.some((column) => column.name === "NUMERO_CASA");
+
+  if (!hasNumeroCasa) {
+    await database.execAsync(`ALTER TABLE ${cadastroTableName} ADD COLUMN NUMERO_CASA TEXT;`);
+  }
+
+  await database.runAsync(
+    `UPDATE ${cadastroTableName}
+     SET NUMERO_CASA = ?
+     WHERE EMAIL = ?
+       AND (NUMERO_CASA IS NULL OR NUMERO_CASA = '')
+       AND NOT EXISTS (SELECT 1 FROM ${cadastroTableName} WHERE NUMERO_CASA = ?)`,
+    defaultCadastro.numeroCasa,
+    defaultCadastro.email,
+    defaultCadastro.numeroCasa
+  );
+
+  await database.execAsync(`CREATE UNIQUE INDEX IF NOT EXISTS IDX_T000_CADASTROS_NUMERO_CASA ON ${cadastroTableName} (NUMERO_CASA);`);
+
+  await database.runAsync(
+    `INSERT OR IGNORE INTO ${cadastroTableName} (NOME, NUMERO_CASA, EMAIL, TELEFONE, SENHA, TIPO_USUARIO)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    defaultCadastro.nome,
+    defaultCadastro.numeroCasa,
+    defaultCadastro.email,
+    defaultCadastro.telefone,
+    defaultCadastro.senha,
+    defaultCadastro.tipoUsuario
+  );
+
+  await database.runAsync(
+    `UPDATE ${cadastroTableName}
+     SET NOME = ?,
+         TELEFONE = ?,
+         SENHA = ?,
+         TIPO_USUARIO = ?
+     WHERE NUMERO_CASA = ?`,
+    defaultCadastro.nome,
+    defaultCadastro.telefone,
+    defaultCadastro.senha,
+    defaultCadastro.tipoUsuario,
+    defaultCadastro.numeroCasa
+  );
+
+  return database;
+}
 
 export default function App() {
   const [state, setState] = useState(seedState);
   const [loaded, setLoaded] = useState(false);
+  const [database, setDatabase] = useState(null);
+  const [databaseError, setDatabaseError] = useState("");
+  const [authReady, setAuthReady] = useState(false);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authUser, setAuthUser] = useState(null);
+  const [loginForm, setLoginForm] = useState({ numeroCasa: defaultCadastro.numeroCasa, senha: "" });
   const [activeTab, setActiveTab] = useState("inicio");
   const [role, setRole] = useState("admin");
   const [receipt, setReceipt] = useState(null);
@@ -84,6 +210,25 @@ export default function App() {
   const [noticeForm, setNoticeForm] = useState({ titulo: "", mensagem: "", tipoAviso: "Manutencao" });
   const [issueForm, setIssueForm] = useState({ descricao: "", tipoOcorrencia: "Vazamento" });
   const [monthRef, setMonthRef] = useState("2026-08");
+
+  useEffect(() => {
+    let mounted = true;
+
+    setupCadastroDatabase()
+      .then((db) => {
+        if (mounted) setDatabase(db);
+      })
+      .catch((error) => {
+        if (mounted) setDatabaseError(error?.message ?? "Nao foi possivel abrir o banco de dados.");
+      })
+      .finally(() => {
+        if (mounted) setAuthReady(true);
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     AsyncStorage.getItem(storageKey).then((saved) => {
@@ -125,6 +270,69 @@ export default function App() {
       updater(draft);
       return draft;
     });
+  }
+
+  async function handleLogin() {
+    const numeroCasa = normalizeHouseNumber(loginForm.numeroCasa);
+    const senha = loginForm.senha.trim();
+
+    if (!numeroCasa || !senha) {
+      Alert.alert("Preencha os campos", "Informe numero da casa e senha para entrar.");
+      return;
+    }
+
+    if (!/^\d+$/.test(senha)) {
+      Alert.alert("Senha invalida", "A senha deve conter apenas digitos.");
+      return;
+    }
+
+    if (!database) {
+      Alert.alert("Banco indisponivel", "Tente novamente em alguns segundos.");
+      return;
+    }
+
+    setAuthBusy(true);
+    try {
+      const user = await database.getFirstAsync(
+        `SELECT ID, NOME, NUMERO_CASA, EMAIL, TELEFONE, TIPO_USUARIO, DATA_CADASTRO
+         FROM ${cadastroTableName}
+         WHERE NUMERO_CASA = ? AND SENHA = ?
+         LIMIT 1`,
+        numeroCasa,
+        senha
+      );
+
+      if (!user) {
+        Alert.alert("Login invalido", "Numero da casa ou senha incorretos.");
+        return;
+      }
+
+      setAuthUser(user);
+      setRole(user.TIPO_USUARIO === "admin" ? "admin" : "morador");
+      setActiveTab("inicio");
+      setLoginForm({ numeroCasa, senha: "" });
+    } catch (error) {
+      Alert.alert("Erro no login", error?.message ?? "Nao foi possivel validar o acesso.");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  function changeRole(nextRole) {
+    if (authUser?.TIPO_USUARIO !== "admin" && nextRole === "admin") return;
+    setRole(nextRole);
+    if (nextRole === "morador" && activeTab === "moradores") setActiveTab("inicio");
+  }
+
+  function handleForgotPassword() {
+    Alert.alert("Esqueci minha senha", "Procure o administrador da Bela Vista para redefinir seu acesso.");
+  }
+
+  function logout() {
+    setAuthUser(null);
+    setRole("admin");
+    setActiveTab("inicio");
+    setLoginForm({ numeroCasa: authUser?.NUMERO_CASA ?? defaultCadastro.numeroCasa, senha: "" });
   }
 
   function resetData() {
@@ -249,22 +457,69 @@ export default function App() {
     ].join("\n"));
   }
 
+  if (!loaded || !authReady) {
+    return (
+      <SafeAreaView style={styles.safe}>
+        <StatusBar barStyle="light-content" backgroundColor="#14322d" />
+        <View style={styles.loadingScreen}>
+          <ActivityIndicator color="#ffffff" size="large" />
+          <Text style={styles.loadingText}>Preparando acesso</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (databaseError) {
+    return (
+      <SafeAreaView style={styles.safe}>
+        <StatusBar barStyle="light-content" backgroundColor="#14322d" />
+        <View style={styles.loadingScreen}>
+          <Text style={styles.errorTitle}>Erro no banco de dados</Text>
+          <Text style={styles.errorText}>{databaseError}</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (!authUser) {
+    return (
+      <LoginScreen
+        authBusy={authBusy}
+        loginForm={loginForm}
+        onForgotPassword={handleForgotPassword}
+        onLogin={handleLogin}
+        setLoginForm={setLoginForm}
+      />
+    );
+  }
+
   const visibleTabs = role === "morador" ? tabs.filter((tab) => !["moradores"].includes(tab.id)) : tabs;
 
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" backgroundColor="#14322d" />
       <View style={styles.header}>
-        <View>
-          <Text style={styles.kicker}>Vila Boa Esperanca</Text>
+        <View style={styles.headerTitleBlock}>
+          <Text style={styles.kicker}>Bela Vista</Text>
           <Text style={styles.title}>Agua Rural</Text>
         </View>
-        <View style={styles.roleSwitch}>
-          <TouchableOpacity style={[styles.roleButton, role === "admin" && styles.roleActive]} onPress={() => setRole("admin")}>
-            <Text style={[styles.roleText, role === "admin" && styles.roleTextActive]}>Admin</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.roleButton, role === "morador" && styles.roleActive]} onPress={() => setRole("morador")}>
-            <Text style={[styles.roleText, role === "morador" && styles.roleTextActive]}>Morador</Text>
+        <View style={styles.headerActions}>
+          {authUser.TIPO_USUARIO === "admin" ? (
+            <View style={styles.roleSwitch}>
+              <TouchableOpacity style={[styles.roleButton, role === "admin" && styles.roleActive]} onPress={() => changeRole("admin")}>
+                <Text style={[styles.roleText, role === "admin" && styles.roleTextActive]}>Admin</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.roleButton, role === "morador" && styles.roleActive]} onPress={() => changeRole("morador")}>
+                <Text style={[styles.roleText, role === "morador" && styles.roleTextActive]}>Morador</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <View style={styles.roleChip}>
+              <Text style={styles.roleChipText}>Morador</Text>
+            </View>
+          )}
+          <TouchableOpacity style={styles.logoutButton} onPress={logout}>
+            <Text style={styles.logoutText}>Sair</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -436,6 +691,50 @@ export default function App() {
   );
 }
 
+function LoginScreen({
+  authBusy,
+  loginForm,
+  onForgotPassword,
+  onLogin,
+  setLoginForm
+}) {
+  return (
+    <SafeAreaView style={styles.loginSafe}>
+      <StatusBar barStyle="light-content" backgroundColor="#14322d" />
+      <ScrollView contentContainerStyle={styles.loginScroll} keyboardShouldPersistTaps="handled">
+        <View style={styles.loginPanel}>
+          <Text style={styles.loginKicker}>Bela Vista</Text>
+          <Text style={styles.loginTitle}>Agua Rural</Text>
+          <Text style={styles.loginSubtitle}>Entrar no sistema</Text>
+
+          <Field
+            autoCapitalize="none"
+            autoCorrect={false}
+            keyboardType="number-pad"
+            placeholder="Numero da casa"
+            returnKeyType="next"
+            value={loginForm.numeroCasa}
+            onChangeText={(numeroCasa) => setLoginForm({ ...loginForm, numeroCasa: onlyDigits(numeroCasa) })}
+          />
+          <Field
+            keyboardType="number-pad"
+            placeholder="Senha"
+            returnKeyType="done"
+            secureTextEntry
+            value={loginForm.senha}
+            onChangeText={(senha) => setLoginForm({ ...loginForm, senha: onlyDigits(senha) })}
+            onSubmitEditing={onLogin}
+          />
+          <PrimaryButton disabled={authBusy} label={authBusy ? "Entrando..." : "Entrar"} onPress={onLogin} />
+          <TouchableOpacity style={styles.forgotButton} onPress={onForgotPassword}>
+            <Text style={styles.forgotText}>Esqueci minha senha</Text>
+          </TouchableOpacity>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
 function Metric({ label, value }) {
   return (
     <View style={styles.metric}>
@@ -461,9 +760,9 @@ function Field(props) {
   return <TextInput {...props} placeholderTextColor="#7a8783" style={[styles.input, props.multiline && styles.textarea]} />;
 }
 
-function PrimaryButton({ label, onPress }) {
+function PrimaryButton({ disabled, label, onPress }) {
   return (
-    <TouchableOpacity style={styles.primaryButton} onPress={onPress}>
+    <TouchableOpacity disabled={disabled} style={[styles.primaryButton, disabled && styles.buttonDisabled]} onPress={onPress}>
       <Text style={styles.primaryButtonText}>{label}</Text>
     </TouchableOpacity>
   );
@@ -515,6 +814,75 @@ const styles = StyleSheet.create({
     backgroundColor: "#14322d",
     paddingTop: StatusBar.currentHeight || 0
   },
+  loadingScreen: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 22,
+    gap: 12
+  },
+  loadingText: {
+    color: "#ffffff",
+    fontWeight: "900"
+  },
+  errorTitle: {
+    color: "#ffffff",
+    fontSize: 20,
+    fontWeight: "900",
+    textAlign: "center"
+  },
+  errorText: {
+    color: "#dcebe7",
+    lineHeight: 21,
+    textAlign: "center"
+  },
+  loginSafe: {
+    flex: 1,
+    backgroundColor: "#14322d",
+    paddingTop: StatusBar.currentHeight || 0
+  },
+  loginScroll: {
+    flexGrow: 1,
+    justifyContent: "center",
+    padding: 18,
+    backgroundColor: "#14322d"
+  },
+  loginPanel: {
+    width: "100%",
+    maxWidth: 460,
+    alignSelf: "center",
+    backgroundColor: "#ffffff",
+    borderColor: "#d8e3df",
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 18,
+    gap: 12
+  },
+  loginKicker: {
+    color: "#146c5f",
+    fontSize: 12,
+    fontWeight: "900",
+    textTransform: "uppercase"
+  },
+  loginTitle: {
+    color: "#16201d",
+    fontSize: 30,
+    fontWeight: "900"
+  },
+  loginSubtitle: {
+    color: "#66736f",
+    lineHeight: 20
+  },
+  forgotButton: {
+    minHeight: 42,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 10
+  },
+  forgotText: {
+    color: "#146c5f",
+    fontWeight: "900"
+  },
   header: {
     backgroundColor: "#14322d",
     paddingHorizontal: 18,
@@ -523,7 +891,18 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    gap: 12
+    gap: 12,
+    flexWrap: "wrap"
+  },
+  headerTitleBlock: {
+    flex: 1,
+    minWidth: 180
+  },
+  headerActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap"
   },
   kicker: {
     color: "#b8cbc6",
@@ -556,6 +935,30 @@ const styles = StyleSheet.create({
   },
   roleTextActive: {
     color: "#14322d"
+  },
+  roleChip: {
+    minHeight: 42,
+    borderRadius: 8,
+    justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.12)",
+    paddingHorizontal: 12
+  },
+  roleChipText: {
+    color: "#ffffff",
+    fontWeight: "900"
+  },
+  logoutButton: {
+    minHeight: 42,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    borderColor: "rgba(255,255,255,0.3)",
+    borderWidth: 1,
+    paddingHorizontal: 12
+  },
+  logoutText: {
+    color: "#ffffff",
+    fontWeight: "900"
   },
   tabs: {
     backgroundColor: "#14322d",
@@ -678,6 +1081,9 @@ const styles = StyleSheet.create({
   primaryButtonText: {
     color: "#ffffff",
     fontWeight: "900"
+  },
+  buttonDisabled: {
+    opacity: 0.64
   },
   secondaryButton: {
     minHeight: 46,
