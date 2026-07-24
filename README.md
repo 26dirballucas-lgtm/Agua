@@ -2,9 +2,12 @@
 
 Prototipo mobile em Expo para gerenciamento do abastecimento de agua de uma vila rural.
 
+<<<<<<< HEAD
 --Comando para iniciar o servidor
 npx expo init
 
+=======
+>>>>>>> 291278d48dbfae82f1c6fb925bbdc5b7b9c21979
 ## Funcionalidades
 
 - cadastro de moradores;
