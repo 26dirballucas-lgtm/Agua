@@ -1,0 +1,24 @@
+{
+  "expo": {
+    "name": "Agua Rural",
+    "slug": "agua-rural",
+    "version": "1.0.0",
+    "sdkVersion": "54.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#146c5f"
+      }
+    },
+    "web": {
+      "bundler": "metro"
+    }
+  }
+}
