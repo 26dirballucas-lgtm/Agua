@@ -70,3 +70,4 @@ Os arquivos `index.html` e `style.css` continuam na pasta como prototipo web ini
 
 
 npx expo start --tunnel --clear
+a
