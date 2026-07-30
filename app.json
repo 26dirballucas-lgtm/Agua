@@ -21,7 +21,13 @@
       "bundler": "metro"
     },
     "plugins": [
-      "expo-sqlite"
+      "expo-sqlite",
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Permitir que o Agua Rural use Face ID para lembrar o login."
+        }
+      ]
     ]
   }
 }

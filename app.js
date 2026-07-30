@@ -1,4 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as LocalAuthentication from "expo-local-authentication";
 import * as SQLite from "expo-sqlite";
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -18,10 +19,18 @@ import {
 } from "react-native";
 
 const storageKey = "agua-rural-state";
+const rememberedLoginKey = "agua-rural-remembered-login";
 const webCadastroStorageKey = "agua-rural-web-cadastros";
+const cadastroResetVersionKey = "agua-rural-cadastros-reset-2026-07-29-password";
+const stateResetVersionKey = "agua-rural-state-reset-2026-07-29-password";
+const bundledDatabaseImportKey = "agua-rural-bundled-db-import-2026-07-29-01";
 const cadastroDatabaseName = "agua-rural.db";
 const cadastroTableName = "T000_CADASTROS";
 const monthlyValue = 30;
+const defaultTemporaryPassword = "1234";
+const bundledDatabaseAsset = require("./database/agua-rural.db");
+const activeStatus = "Ativo";
+const inactiveStatus = "Inativo";
 const defaultCadastro = {
   nome: "Lucas",
   numeroCasa: "01",
@@ -33,9 +42,9 @@ const defaultCadastro = {
 
 const seedState = {
   usuarios: [
-    { id: 1, nome: "Ana Martins", telefone: "(38) 99910-1200", email: "ana@email.com", tipoUsuario: "morador" },
-    { id: 2, nome: "Jose Pereira", telefone: "(38) 99840-2201", email: "jose@email.com", tipoUsuario: "morador" },
-    { id: 3, nome: "Carla Souza", telefone: "(38) 99750-3302", email: "carla@email.com", tipoUsuario: "morador" }
+    { id: 1, nome: "Ana Martins", telefone: "(38) 99910-1200", email: "ana@email.com", numeroCasa: "12", tipoUsuario: "morador", situacao: activeStatus },
+    { id: 2, nome: "Jose Pereira", telefone: "(38) 99840-2201", email: "jose@email.com", numeroCasa: "08", tipoUsuario: "morador", situacao: activeStatus },
+    { id: 3, nome: "Carla Souza", telefone: "(38) 99750-3302", email: "carla@email.com", numeroCasa: "21", tipoUsuario: "morador", situacao: activeStatus }
   ],
   residencias: [
     { id: 1, usuarioId: 1, endereco: "Comunidade Lagoa Clara", numero: "12", observacao: "Proximo ao campo" },
@@ -87,6 +96,13 @@ const money = (value) => Number(value).toLocaleString("pt-BR", { style: "currenc
 const dateBR = (date) => new Date(`${date}T00:00:00`).toLocaleDateString("pt-BR");
 const monthBR = (month) => new Date(`${month}-01T00:00:00`).toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
 const onlyDigits = (value) => value.replace(/\D/g, "");
+const formatPhone = (value) => {
+  const digits = onlyDigits(value).slice(0, 11);
+  if (digits.length <= 2) return digits;
+  if (digits.length <= 6) return `(${digits.slice(0, 2)}) ${digits.slice(2)}`;
+  if (digits.length <= 10) return `(${digits.slice(0, 2)}) ${digits.slice(2, 6)}-${digits.slice(6)}`;
+  return `(${digits.slice(0, 2)}) ${digits.slice(2, 7)}-${digits.slice(7)}`;
+};
 const normalizeHouseNumber = (value) => {
   const digits = onlyDigits(value);
   return digits.length === 1 ? `0${digits}` : digits;
@@ -100,10 +116,82 @@ const toCadastroRecord = (cadastro) => ({
   TELEFONE: cadastro.telefone,
   SENHA: cadastro.senha,
   TIPO_USUARIO: cadastro.tipoUsuario,
+  SENHA_TEMPORARIA: cadastro.senhaTemporaria ? 1 : 0,
+  SITUACAO: cadastro.situacao ?? activeStatus,
   DATA_CADASTRO: cadastro.dataCadastro ?? new Date().toISOString()
 });
 
+const getCadastroRole = (tipoUsuario) => tipoUsuario === "admin" ? "admin" : "morador";
+async function authenticateWithDevice() {
+  if (Platform.OS === "web") {
+    Alert.alert("Recurso indisponivel", "A autenticacao por senha ou biometria do aparelho funciona no celular.");
+    return false;
+  }
+
+  const securityLevel = await LocalAuthentication.getEnrolledLevelAsync();
+
+  if (securityLevel === LocalAuthentication.SecurityLevel.NONE) {
+    Alert.alert("Bloqueio do celular indisponivel", "Configure senha, digital ou reconhecimento facial no aparelho para usar este recurso.");
+    return false;
+  }
+
+  const result = await LocalAuthentication.authenticateAsync({
+    promptMessage: "Confirmar acesso ao Agua Rural",
+    cancelLabel: "Cancelar",
+    fallbackLabel: "Usar senha do celular",
+    disableDeviceFallback: false
+  });
+
+  return Boolean(result.success);
+}
+
+function showConfirmationAlert({
+  title,
+  message,
+  cancelText = "Cancelar",
+  confirmText,
+  confirmStyle = "default",
+  onConfirm
+}) {
+  if (Platform.OS === "web" && typeof globalThis.confirm === "function") {
+    if (globalThis.confirm(`${title}\n\n${message}`)) onConfirm();
+    return;
+  }
+
+  Alert.alert(
+    title,
+    message,
+    [
+      { text: cancelText, style: "cancel" },
+      { text: confirmText, style: confirmStyle, onPress: onConfirm }
+    ]
+  );
+}
+
+async function findCadastroByNumeroCasa(database, numeroCasa) {
+  if (Platform.OS === "web") {
+    const current = JSON.parse((await AsyncStorage.getItem(webCadastroStorageKey)) ?? "[]");
+    return current.find((cadastro) => cadastro.NUMERO_CASA === numeroCasa) ?? null;
+  }
+
+  return database.getFirstAsync(
+    `SELECT ID, NOME, NUMERO_CASA, EMAIL, TELEFONE, TIPO_USUARIO, SENHA_TEMPORARIA, SITUACAO, DATA_CADASTRO
+     FROM ${cadastroTableName}
+     WHERE NUMERO_CASA = ?
+       AND (SITUACAO IS NULL OR SITUACAO != ?)
+     LIMIT 1`,
+    numeroCasa,
+    inactiveStatus
+  );
+}
+
 async function setupWebCadastroStorage() {
+  const shouldResetCadastros = (await AsyncStorage.getItem(cadastroResetVersionKey)) !== "done";
+  if (shouldResetCadastros) {
+    await AsyncStorage.removeItem(webCadastroStorageKey);
+    await AsyncStorage.removeItem(rememberedLoginKey);
+  }
+
   const saved = await AsyncStorage.getItem(webCadastroStorageKey);
   const cadastros = saved ? JSON.parse(saved) : [];
   const defaultRecord = toCadastroRecord(defaultCadastro);
@@ -116,13 +204,357 @@ async function setupWebCadastroStorage() {
   }
 
   await AsyncStorage.setItem(webCadastroStorageKey, JSON.stringify(cadastros));
+  if (shouldResetCadastros) await AsyncStorage.setItem(cadastroResetVersionKey, "done");
 
   return {
     getFirstAsync: async (_query, numeroCasa, senha) => {
       const current = JSON.parse((await AsyncStorage.getItem(webCadastroStorageKey)) ?? "[]");
-      return current.find((cadastro) => cadastro.NUMERO_CASA === numeroCasa && cadastro.SENHA === senha) ?? null;
+      return current.find((cadastro) => cadastro.NUMERO_CASA === numeroCasa && cadastro.SENHA === senha && cadastro.SITUACAO !== inactiveStatus) ?? null;
     }
   };
+}
+
+async function createMoradorCadastro(database, cadastro) {
+  const numeroCasa = normalizeHouseNumber(cadastro.numeroCasa);
+  const record = toCadastroRecord({
+    nome: cadastro.nome.trim(),
+    numeroCasa,
+    email: `casa${numeroCasa}@agua-rural.local`,
+    telefone: cadastro.telefone.trim(),
+    senha: defaultTemporaryPassword,
+    tipoUsuario: cadastro.tipoUsuario === "admin" ? "admin" : "morador",
+    senhaTemporaria: true,
+    situacao: activeStatus
+  });
+
+  if (Platform.OS === "web") {
+    const current = JSON.parse((await AsyncStorage.getItem(webCadastroStorageKey)) ?? "[]");
+    const hasNumeroCasa = current.some((item) => item.NUMERO_CASA === record.NUMERO_CASA);
+
+    if (hasNumeroCasa) throw new Error("Ja existe cadastro com esse numero da casa.");
+
+    current.push({ ...record, ID: nextId(current.map((item) => ({ id: item.ID }))) });
+    await AsyncStorage.setItem(webCadastroStorageKey, JSON.stringify(current));
+    return;
+  }
+
+  await database.runAsync(
+    `INSERT INTO ${cadastroTableName} (NOME, NUMERO_CASA, EMAIL, TELEFONE, SENHA, TIPO_USUARIO, SENHA_TEMPORARIA, SITUACAO)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    record.NOME,
+    record.NUMERO_CASA,
+    record.EMAIL,
+    record.TELEFONE,
+    record.SENHA,
+    record.TIPO_USUARIO,
+    record.SENHA_TEMPORARIA,
+    record.SITUACAO
+  );
+}
+
+async function updateCadastroPassword(database, numeroCasa, senha) {
+  if (Platform.OS === "web") {
+    const current = JSON.parse((await AsyncStorage.getItem(webCadastroStorageKey)) ?? "[]");
+    const updated = current.map((cadastro) => cadastro.NUMERO_CASA === numeroCasa
+      ? { ...cadastro, SENHA: senha, SENHA_TEMPORARIA: 0 }
+      : cadastro);
+    await AsyncStorage.setItem(webCadastroStorageKey, JSON.stringify(updated));
+    return;
+  }
+
+  await database.runAsync(
+    `UPDATE ${cadastroTableName}
+     SET SENHA = ?,
+         SENHA_TEMPORARIA = 0
+     WHERE NUMERO_CASA = ?`,
+    senha,
+    numeroCasa
+  );
+}
+
+async function updateMoradorCadastro(database, currentNumeroCasa, morador) {
+  const numeroCasa = normalizeHouseNumber(morador.numeroCasa);
+  const tipoUsuario = morador.tipoUsuario === "admin" ? "admin" : "morador";
+  const situacao = morador.situacao ?? activeStatus;
+
+  if (Platform.OS === "web") {
+    const current = JSON.parse((await AsyncStorage.getItem(webCadastroStorageKey)) ?? "[]");
+    const updated = current.map((cadastro) => cadastro.NUMERO_CASA === currentNumeroCasa
+      ? {
+        ...cadastro,
+        NOME: morador.nome.trim(),
+        NUMERO_CASA: numeroCasa,
+        EMAIL: `casa${numeroCasa}@agua-rural.local`,
+        TELEFONE: morador.telefone.trim(),
+        TIPO_USUARIO: tipoUsuario,
+        SITUACAO: situacao
+      }
+      : cadastro);
+    await AsyncStorage.setItem(webCadastroStorageKey, JSON.stringify(updated));
+    return;
+  }
+
+  await database.runAsync(
+    `UPDATE ${cadastroTableName}
+     SET NOME = ?,
+         NUMERO_CASA = ?,
+         EMAIL = ?,
+         TELEFONE = ?,
+         TIPO_USUARIO = ?,
+         SITUACAO = ?
+     WHERE NUMERO_CASA = ?`,
+    morador.nome.trim(),
+    numeroCasa,
+    `casa${numeroCasa}@agua-rural.local`,
+    morador.telefone.trim(),
+    tipoUsuario,
+    situacao,
+    currentNumeroCasa
+  );
+}
+
+async function deleteMoradorCadastro(database, numeroCasa) {
+  if (Platform.OS === "web") {
+    const current = JSON.parse((await AsyncStorage.getItem(webCadastroStorageKey)) ?? "[]");
+    await AsyncStorage.setItem(webCadastroStorageKey, JSON.stringify(current.filter((cadastro) => cadastro.NUMERO_CASA !== numeroCasa)));
+    return;
+  }
+
+  await database.runAsync(`DELETE FROM ${cadastroTableName} WHERE NUMERO_CASA = ?`, numeroCasa);
+}
+
+async function importBundledDatabaseIfNeeded() {
+  if (Platform.OS === "web") return;
+
+  const alreadyImported = await AsyncStorage.getItem(bundledDatabaseImportKey);
+  if (alreadyImported === "done") return;
+
+  await SQLite.importDatabaseFromAssetAsync(cadastroDatabaseName, {
+    assetId: bundledDatabaseAsset,
+    forceOverwrite: true
+  });
+  await AsyncStorage.setItem(bundledDatabaseImportKey, "done");
+  await AsyncStorage.setItem(cadastroResetVersionKey, "done");
+  await AsyncStorage.removeItem(rememberedLoginKey);
+}
+
+async function setupDomainTables(database, shouldResetData = false) {
+  await database.execAsync(`
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE IF NOT EXISTS T001_USUARIOS (
+      ID INTEGER PRIMARY KEY AUTOINCREMENT,
+      NOME TEXT NOT NULL,
+      TELEFONE TEXT NOT NULL,
+      EMAIL TEXT,
+      NUMERO_CASA TEXT NOT NULL UNIQUE,
+      TIPO_USUARIO TEXT NOT NULL DEFAULT 'morador',
+      SITUACAO TEXT NOT NULL DEFAULT 'Ativo'
+    );
+
+    CREATE TABLE IF NOT EXISTS T002_RESIDENCIAS (
+      ID INTEGER PRIMARY KEY AUTOINCREMENT,
+      USUARIO_ID INTEGER NOT NULL,
+      ENDERECO TEXT NOT NULL,
+      NUMERO TEXT NOT NULL,
+      OBSERVACAO TEXT,
+      FOREIGN KEY (USUARIO_ID) REFERENCES T001_USUARIOS (ID)
+    );
+
+    CREATE TABLE IF NOT EXISTS T003_COBRANCAS (
+      ID INTEGER PRIMARY KEY AUTOINCREMENT,
+      RESIDENCIA_ID INTEGER NOT NULL,
+      MES_REFERENCIA TEXT NOT NULL,
+      VALOR REAL NOT NULL,
+      DATA_VENCIMENTO TEXT NOT NULL,
+      SITUACAO TEXT NOT NULL DEFAULT 'Pendente',
+      UNIQUE (RESIDENCIA_ID, MES_REFERENCIA),
+      FOREIGN KEY (RESIDENCIA_ID) REFERENCES T002_RESIDENCIAS (ID)
+    );
+
+    CREATE TABLE IF NOT EXISTS T004_PAGAMENTOS (
+      ID INTEGER PRIMARY KEY AUTOINCREMENT,
+      COBRANCA_ID INTEGER NOT NULL,
+      VALOR_PAGO REAL NOT NULL,
+      DATA_PAGAMENTO TEXT NOT NULL,
+      FORMA_PAGAMENTO TEXT NOT NULL,
+      OBSERVACAO TEXT,
+      FOREIGN KEY (COBRANCA_ID) REFERENCES T003_COBRANCAS (ID)
+    );
+
+    CREATE TABLE IF NOT EXISTS T005_AVISOS (
+      ID INTEGER PRIMARY KEY AUTOINCREMENT,
+      TITULO TEXT NOT NULL,
+      MENSAGEM TEXT NOT NULL,
+      DATA_PUBLICACAO TEXT NOT NULL,
+      TIPO_AVISO TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS T006_OCORRENCIAS (
+      ID INTEGER PRIMARY KEY AUTOINCREMENT,
+      USUARIO_ID INTEGER NOT NULL,
+      TIPO_OCORRENCIA TEXT NOT NULL,
+      DESCRICAO TEXT NOT NULL,
+      DATA_ABERTURA TEXT NOT NULL,
+      SITUACAO TEXT NOT NULL DEFAULT 'Aberta',
+      FOREIGN KEY (USUARIO_ID) REFERENCES T001_USUARIOS (ID)
+    );
+  `);
+
+  const usuarioColumns = await database.getAllAsync("PRAGMA table_info(T001_USUARIOS)");
+  const hasUsuarioSituacao = usuarioColumns.some((column) => column.name === "SITUACAO");
+  if (!hasUsuarioSituacao) {
+    await database.execAsync("ALTER TABLE T001_USUARIOS ADD COLUMN SITUACAO TEXT NOT NULL DEFAULT 'Ativo';");
+  }
+
+  if (shouldResetData) {
+    await database.execAsync(`
+      DELETE FROM T004_PAGAMENTOS;
+      DELETE FROM T006_OCORRENCIAS;
+      DELETE FROM T003_COBRANCAS;
+      DELETE FROM T002_RESIDENCIAS;
+      DELETE FROM T001_USUARIOS;
+      DELETE FROM T005_AVISOS;
+    `);
+  }
+
+  for (const user of seedState.usuarios) {
+    await database.runAsync(
+      `INSERT OR IGNORE INTO T001_USUARIOS (ID, NOME, TELEFONE, EMAIL, NUMERO_CASA, TIPO_USUARIO, SITUACAO)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      user.id,
+      user.nome,
+      user.telefone,
+      user.email ?? null,
+      user.numeroCasa,
+      user.tipoUsuario,
+      user.situacao ?? activeStatus
+    );
+  }
+
+  for (const home of seedState.residencias) {
+    await database.runAsync(
+      `INSERT OR IGNORE INTO T002_RESIDENCIAS (ID, USUARIO_ID, ENDERECO, NUMERO, OBSERVACAO)
+       VALUES (?, ?, ?, ?, ?)`,
+      home.id,
+      home.usuarioId,
+      home.endereco,
+      home.numero,
+      home.observacao
+    );
+  }
+
+  for (const charge of seedState.cobrancas) {
+    await database.runAsync(
+      `INSERT OR IGNORE INTO T003_COBRANCAS (ID, RESIDENCIA_ID, MES_REFERENCIA, VALOR, DATA_VENCIMENTO, SITUACAO)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      charge.id,
+      charge.residenciaId,
+      charge.mesReferencia,
+      charge.valor,
+      charge.dataVencimento,
+      charge.situacao
+    );
+  }
+
+  for (const payment of seedState.pagamentos) {
+    await database.runAsync(
+      `INSERT OR IGNORE INTO T004_PAGAMENTOS (ID, COBRANCA_ID, VALOR_PAGO, DATA_PAGAMENTO, FORMA_PAGAMENTO, OBSERVACAO)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      payment.id,
+      payment.cobrancaId,
+      payment.valorPago,
+      payment.dataPagamento,
+      payment.formaPagamento,
+      payment.observacao
+    );
+  }
+
+  for (const notice of seedState.avisos) {
+    await database.runAsync(
+      `INSERT OR IGNORE INTO T005_AVISOS (ID, TITULO, MENSAGEM, DATA_PUBLICACAO, TIPO_AVISO)
+       VALUES (?, ?, ?, ?, ?)`,
+      notice.id,
+      notice.titulo,
+      notice.mensagem,
+      notice.dataPublicacao,
+      notice.tipoAviso
+    );
+  }
+
+  for (const issue of seedState.ocorrencias) {
+    await database.runAsync(
+      `INSERT OR IGNORE INTO T006_OCORRENCIAS (ID, USUARIO_ID, TIPO_OCORRENCIA, DESCRICAO, DATA_ABERTURA, SITUACAO)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      issue.id,
+      issue.usuarioId,
+      issue.tipoOcorrencia,
+      issue.descricao,
+      issue.dataAbertura,
+      issue.situacao
+    );
+  }
+}
+
+async function createMoradorData(database, morador) {
+  if (Platform.OS === "web") return;
+
+  await database.runAsync(
+    `INSERT INTO T001_USUARIOS (NOME, TELEFONE, EMAIL, NUMERO_CASA, TIPO_USUARIO, SITUACAO)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    morador.nome.trim(),
+    morador.telefone.trim(),
+    null,
+    morador.numeroCasa,
+    morador.tipoUsuario === "admin" ? "admin" : "morador",
+    morador.situacao ?? activeStatus
+  );
+}
+
+async function updateMoradorData(database, currentNumeroCasa, morador) {
+  if (Platform.OS === "web") return;
+
+  await database.runAsync(
+    `UPDATE T001_USUARIOS
+     SET NOME = ?,
+         TELEFONE = ?,
+         NUMERO_CASA = ?,
+         TIPO_USUARIO = ?,
+         SITUACAO = ?
+     WHERE NUMERO_CASA = ?`,
+    morador.nome.trim(),
+    morador.telefone.trim(),
+    normalizeHouseNumber(morador.numeroCasa),
+    morador.tipoUsuario === "admin" ? "admin" : "morador",
+    morador.situacao ?? activeStatus,
+    currentNumeroCasa
+  );
+}
+
+async function deleteMoradorData(database, numeroCasa) {
+  if (Platform.OS === "web") return;
+
+  const user = await database.getFirstAsync("SELECT ID FROM T001_USUARIOS WHERE NUMERO_CASA = ? LIMIT 1", numeroCasa);
+  if (!user) return;
+
+  await database.runAsync(
+    `DELETE FROM T004_PAGAMENTOS
+     WHERE COBRANCA_ID IN (
+       SELECT C.ID
+       FROM T003_COBRANCAS C
+       INNER JOIN T002_RESIDENCIAS R ON R.ID = C.RESIDENCIA_ID
+       WHERE R.USUARIO_ID = ?
+     )`,
+    user.ID
+  );
+  await database.runAsync(
+    `DELETE FROM T003_COBRANCAS
+     WHERE RESIDENCIA_ID IN (SELECT ID FROM T002_RESIDENCIAS WHERE USUARIO_ID = ?)`,
+    user.ID
+  );
+  await database.runAsync("DELETE FROM T002_RESIDENCIAS WHERE USUARIO_ID = ?", user.ID);
+  await database.runAsync("DELETE FROM T006_OCORRENCIAS WHERE USUARIO_ID = ?", user.ID);
+  await database.runAsync("DELETE FROM T001_USUARIOS WHERE ID = ?", user.ID);
 }
 
 async function setupCadastroDatabase() {
@@ -130,6 +562,7 @@ async function setupCadastroDatabase() {
     return setupWebCadastroStorage();
   }
 
+  await importBundledDatabaseIfNeeded();
   const database = await SQLite.openDatabaseAsync(cadastroDatabaseName);
 
   await database.execAsync(`
@@ -141,15 +574,31 @@ async function setupCadastroDatabase() {
       TELEFONE TEXT,
       SENHA TEXT NOT NULL,
       TIPO_USUARIO TEXT NOT NULL DEFAULT 'morador',
+      SENHA_TEMPORARIA INTEGER NOT NULL DEFAULT 0,
+      SITUACAO TEXT NOT NULL DEFAULT 'Ativo',
       DATA_CADASTRO TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
   `);
 
   const columns = await database.getAllAsync(`PRAGMA table_info(${cadastroTableName})`);
   const hasNumeroCasa = columns.some((column) => column.name === "NUMERO_CASA");
+  const hasSenhaTemporaria = columns.some((column) => column.name === "SENHA_TEMPORARIA");
+  const hasCadastroSituacao = columns.some((column) => column.name === "SITUACAO");
 
   if (!hasNumeroCasa) {
     await database.execAsync(`ALTER TABLE ${cadastroTableName} ADD COLUMN NUMERO_CASA TEXT;`);
+  }
+  if (!hasSenhaTemporaria) {
+    await database.execAsync(`ALTER TABLE ${cadastroTableName} ADD COLUMN SENHA_TEMPORARIA INTEGER NOT NULL DEFAULT 0;`);
+  }
+  if (!hasCadastroSituacao) {
+    await database.execAsync(`ALTER TABLE ${cadastroTableName} ADD COLUMN SITUACAO TEXT NOT NULL DEFAULT 'Ativo';`);
+  }
+
+  const shouldResetCadastros = (await AsyncStorage.getItem(cadastroResetVersionKey)) !== "done";
+  if (shouldResetCadastros) {
+    await database.execAsync(`DELETE FROM ${cadastroTableName};`);
+    await AsyncStorage.removeItem(rememberedLoginKey);
   }
 
   await database.runAsync(
@@ -166,14 +615,15 @@ async function setupCadastroDatabase() {
   await database.execAsync(`CREATE UNIQUE INDEX IF NOT EXISTS IDX_T000_CADASTROS_NUMERO_CASA ON ${cadastroTableName} (NUMERO_CASA);`);
 
   await database.runAsync(
-    `INSERT OR IGNORE INTO ${cadastroTableName} (NOME, NUMERO_CASA, EMAIL, TELEFONE, SENHA, TIPO_USUARIO)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT OR IGNORE INTO ${cadastroTableName} (NOME, NUMERO_CASA, EMAIL, TELEFONE, SENHA, TIPO_USUARIO, SENHA_TEMPORARIA, SITUACAO)
+     VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
     defaultCadastro.nome,
     defaultCadastro.numeroCasa,
     defaultCadastro.email,
     defaultCadastro.telefone,
     defaultCadastro.senha,
-    defaultCadastro.tipoUsuario
+    defaultCadastro.tipoUsuario,
+    activeStatus
   );
 
   await database.runAsync(
@@ -181,14 +631,20 @@ async function setupCadastroDatabase() {
      SET NOME = ?,
          TELEFONE = ?,
          SENHA = ?,
-         TIPO_USUARIO = ?
+         TIPO_USUARIO = ?,
+         SENHA_TEMPORARIA = 0,
+         SITUACAO = ?
      WHERE NUMERO_CASA = ?`,
     defaultCadastro.nome,
     defaultCadastro.telefone,
     defaultCadastro.senha,
     defaultCadastro.tipoUsuario,
+    activeStatus,
     defaultCadastro.numeroCasa
   );
+
+  await setupDomainTables(database, shouldResetCadastros);
+  if (shouldResetCadastros) await AsyncStorage.setItem(cadastroResetVersionKey, "done");
 
   return database;
 }
@@ -201,11 +657,19 @@ export default function App() {
   const [authReady, setAuthReady] = useState(false);
   const [authBusy, setAuthBusy] = useState(false);
   const [authUser, setAuthUser] = useState(null);
-  const [loginForm, setLoginForm] = useState({ numeroCasa: defaultCadastro.numeroCasa, senha: "" });
+  const [loginForm, setLoginForm] = useState({ numeroCasa: "", senha: "" });
+  const [rememberedLogin, setRememberedLogin] = useState(null);
+  const [passwordChangeUser, setPasswordChangeUser] = useState(null);
+  const [passwordForm, setPasswordForm] = useState({ senha: "", repetirSenha: "" });
   const [activeTab, setActiveTab] = useState("inicio");
-  const [role, setRole] = useState("admin");
+  const [role, setRole] = useState("morador");
   const [receipt, setReceipt] = useState(null);
-  const [residentForm, setResidentForm] = useState({ nome: "", telefone: "", email: "" });
+  const [residentForm, setResidentForm] = useState({ nome: "", telefone: "", numeroCasa: "", tipoUsuario: "morador" });
+  const [editingResident, setEditingResident] = useState(null);
+  const [editResidentForm, setEditResidentForm] = useState({ nome: "", telefone: "", numeroCasa: "", tipoUsuario: "morador", situacao: activeStatus });
+  const [passwordEditResident, setPasswordEditResident] = useState(null);
+  const [editPasswordForm, setEditPasswordForm] = useState({ senha: "", repetirSenha: "" });
+  const [feedback, setFeedback] = useState(null);
   const [homeForm, setHomeForm] = useState({ endereco: "", numero: "", observacao: "" });
   const [noticeForm, setNoticeForm] = useState({ titulo: "", mensagem: "", tipoAviso: "Manutencao" });
   const [issueForm, setIssueForm] = useState({ descricao: "", tipoOcorrencia: "Vazamento" });
@@ -231,9 +695,31 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    AsyncStorage.getItem(storageKey).then((saved) => {
+    async function loadState() {
+      const shouldResetState = (await AsyncStorage.getItem(stateResetVersionKey)) !== "done";
+      if (shouldResetState) {
+        await AsyncStorage.setItem(storageKey, JSON.stringify(seedState));
+        await AsyncStorage.setItem(stateResetVersionKey, "done");
+        setState(clone(seedState));
+        setLoaded(true);
+        return;
+      }
+
+      const saved = await AsyncStorage.getItem(storageKey);
       if (saved) setState(JSON.parse(saved));
       setLoaded(true);
+    }
+
+    loadState();
+  }, []);
+
+  useEffect(() => {
+    AsyncStorage.getItem(rememberedLoginKey).then((saved) => {
+      if (!saved) return;
+      const remembered = JSON.parse(saved);
+      if (!remembered?.numeroCasa) return;
+      setRememberedLogin(remembered);
+      setLoginForm((current) => ({ ...current, numeroCasa: remembered.numeroCasa }));
     });
   }, []);
 
@@ -272,17 +758,17 @@ export default function App() {
     });
   }
 
+  function showFeedback(text, tone = "ok") {
+    setFeedback({ text, tone });
+    setTimeout(() => setFeedback((current) => current?.text === text ? null : current), 3600);
+  }
+
   async function handleLogin() {
     const numeroCasa = normalizeHouseNumber(loginForm.numeroCasa);
     const senha = loginForm.senha.trim();
 
     if (!numeroCasa || !senha) {
       Alert.alert("Preencha os campos", "Informe numero da casa e senha para entrar.");
-      return;
-    }
-
-    if (!/^\d+$/.test(senha)) {
-      Alert.alert("Senha invalida", "A senha deve conter apenas digitos.");
       return;
     }
 
@@ -294,12 +780,14 @@ export default function App() {
     setAuthBusy(true);
     try {
       const user = await database.getFirstAsync(
-        `SELECT ID, NOME, NUMERO_CASA, EMAIL, TELEFONE, TIPO_USUARIO, DATA_CADASTRO
+        `SELECT ID, NOME, NUMERO_CASA, EMAIL, TELEFONE, TIPO_USUARIO, SENHA_TEMPORARIA, SITUACAO, DATA_CADASTRO
          FROM ${cadastroTableName}
          WHERE NUMERO_CASA = ? AND SENHA = ?
+           AND (SITUACAO IS NULL OR SITUACAO != ?)
          LIMIT 1`,
         numeroCasa,
-        senha
+        senha,
+        inactiveStatus
       );
 
       if (!user) {
@@ -307,10 +795,21 @@ export default function App() {
         return;
       }
 
+      if (Number(user.SENHA_TEMPORARIA) === 1) {
+        setPasswordChangeUser(user);
+        setPasswordForm({ senha: "", repetirSenha: "" });
+        setLoginForm({ numeroCasa, senha: "" });
+        return;
+      }
+
       setAuthUser(user);
-      setRole(user.TIPO_USUARIO === "admin" ? "admin" : "morador");
+      setRole(getCadastroRole(user.TIPO_USUARIO));
       setActiveTab("inicio");
       setLoginForm({ numeroCasa, senha: "" });
+
+      if (rememberedLogin?.numeroCasa !== numeroCasa) {
+        askToRememberLogin(user, numeroCasa);
+      }
     } catch (error) {
       Alert.alert("Erro no login", error?.message ?? "Nao foi possivel validar o acesso.");
     } finally {
@@ -318,10 +817,104 @@ export default function App() {
     }
   }
 
-  function changeRole(nextRole) {
-    if (authUser?.TIPO_USUARIO !== "admin" && nextRole === "admin") return;
-    setRole(nextRole);
-    if (nextRole === "morador" && activeTab === "moradores") setActiveTab("inicio");
+  async function handleRememberedLogin() {
+    if (!rememberedLogin?.numeroCasa) return;
+    if (!database) {
+      Alert.alert("Banco indisponivel", "Tente novamente em alguns segundos.");
+      return;
+    }
+
+    setAuthBusy(true);
+    try {
+      const deviceAuthenticated = await authenticateWithDevice();
+      if (!deviceAuthenticated) return;
+
+      const user = await findCadastroByNumeroCasa(database, rememberedLogin.numeroCasa);
+      if (!user) {
+        await AsyncStorage.removeItem(rememberedLoginKey);
+        setRememberedLogin(null);
+        Alert.alert("Login removido", "Esse cadastro nao existe mais. Entre novamente com numero da casa e senha.");
+        return;
+      }
+
+      if (Number(user.SENHA_TEMPORARIA) === 1) {
+        setPasswordChangeUser(user);
+        setPasswordForm({ senha: "", repetirSenha: "" });
+        return;
+      }
+
+      setAuthUser(user);
+      setRole(getCadastroRole(user.TIPO_USUARIO));
+      setActiveTab("inicio");
+      setLoginForm({ numeroCasa: user.NUMERO_CASA, senha: "" });
+    } catch (error) {
+      Alert.alert("Erro no login", error?.message ?? "Nao foi possivel validar o acesso.");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  function askToRememberLogin(user, numeroCasa) {
+    showConfirmationAlert({
+      title: "Lembrar login?",
+      message: "Na proxima vez, voce podera entrar usando a senha, digital ou reconhecimento facial do celular.",
+      cancelText: "Agora nao",
+      confirmText: "Lembrar",
+      onConfirm: async () => {
+        const deviceAuthenticated = await authenticateWithDevice();
+        if (!deviceAuthenticated) return;
+
+        const remembered = { numeroCasa, nome: user.NOME };
+        await AsyncStorage.setItem(rememberedLoginKey, JSON.stringify(remembered));
+        setRememberedLogin(remembered);
+      }
+    });
+  }
+
+  async function handleChangeTemporaryPassword() {
+    const senha = passwordForm.senha.trim();
+    const repetirSenha = passwordForm.repetirSenha.trim();
+
+    if (!senha || !repetirSenha) {
+      Alert.alert("Preencha os campos", "Digite a nova senha e repita para confirmar.");
+      return;
+    }
+
+    if (senha.length < 4) {
+      Alert.alert("Senha fraca", "Use pelo menos 4 caracteres.");
+      return;
+    }
+
+    if (senha === defaultTemporaryPassword) {
+      Alert.alert("Troque a senha", "Escolha uma senha diferente da senha padrao 1234.");
+      return;
+    }
+
+    if (senha !== repetirSenha) {
+      Alert.alert("Senhas diferentes", "A repeticao precisa ser igual a nova senha.");
+      return;
+    }
+
+    if (!database || !passwordChangeUser) {
+      Alert.alert("Banco indisponivel", "Tente novamente em alguns segundos.");
+      return;
+    }
+
+    setAuthBusy(true);
+    try {
+      await updateCadastroPassword(database, passwordChangeUser.NUMERO_CASA, senha);
+      const updatedUser = { ...passwordChangeUser, SENHA_TEMPORARIA: 0 };
+      setPasswordChangeUser(null);
+      setPasswordForm({ senha: "", repetirSenha: "" });
+      setAuthUser(updatedUser);
+      setRole(getCadastroRole(updatedUser.TIPO_USUARIO));
+      setActiveTab("inicio");
+      askToRememberLogin(updatedUser, updatedUser.NUMERO_CASA);
+    } catch (error) {
+      Alert.alert("Erro ao trocar senha", error?.message ?? "Nao foi possivel salvar a nova senha.");
+    } finally {
+      setAuthBusy(false);
+    }
   }
 
   function handleForgotPassword() {
@@ -329,26 +922,255 @@ export default function App() {
   }
 
   function logout() {
-    setAuthUser(null);
-    setRole("admin");
-    setActiveTab("inicio");
-    setLoginForm({ numeroCasa: authUser?.NUMERO_CASA ?? defaultCadastro.numeroCasa, senha: "" });
+    showConfirmationAlert({
+      title: "Sair da conta?",
+      message: "Voce voltara para a tela de login.",
+      confirmText: "Sair",
+      confirmStyle: "destructive",
+      onConfirm: () => {
+        setAuthUser(null);
+        setRole("morador");
+        setActiveTab("inicio");
+        setLoginForm({ numeroCasa: authUser?.NUMERO_CASA ?? defaultCadastro.numeroCasa, senha: "" });
+      }
+    });
   }
 
   function resetData() {
-    setState(clone(seedState));
-    Alert.alert("Dados restaurados", "O exemplo inicial foi carregado novamente.");
+    showConfirmationAlert({
+      title: "Recarregar dados de exemplo?",
+      message: "Os dados atuais da tela serao substituidos pelos exemplos iniciais.",
+      confirmText: "Recarregar",
+      confirmStyle: "destructive",
+      onConfirm: () => {
+        setState(clone(seedState));
+        showFeedback("Dados de exemplo recarregados.");
+      }
+    });
   }
 
-  function addResident() {
-    if (!residentForm.nome.trim() || !residentForm.telefone.trim()) {
-      Alert.alert("Preencha os campos", "Nome e telefone sao obrigatorios.");
+  async function addResident() {
+    const numeroCasa = normalizeHouseNumber(residentForm.numeroCasa);
+
+    if (!residentForm.nome.trim() || !residentForm.telefone.trim() || !numeroCasa) {
+      Alert.alert("Preencha os campos", "Nome, telefone e numero da casa sao obrigatorios.");
       return;
     }
-    updateState((draft) => {
-      draft.usuarios.push({ id: nextId(draft.usuarios), ...residentForm, tipoUsuario: "morador" });
+
+    if (!/^\d+$/.test(numeroCasa)) {
+      Alert.alert("Numero invalido", "O numero da casa deve conter apenas digitos.");
+      return;
+    }
+
+    if (state.usuarios.some((user) => user.numeroCasa === numeroCasa)) {
+      Alert.alert("Cadastro duplicado", "Ja existe morador com esse numero da casa.");
+      return;
+    }
+
+    if (!database) {
+      Alert.alert("Banco indisponivel", "Tente novamente em alguns segundos.");
+      return;
+    }
+
+    try {
+      await createMoradorCadastro(database, { ...residentForm, numeroCasa });
+      await createMoradorData(database, { ...residentForm, numeroCasa });
+      updateState((draft) => {
+        draft.usuarios.push({ id: nextId(draft.usuarios), ...residentForm, numeroCasa, tipoUsuario: residentForm.tipoUsuario });
+      });
+      setResidentForm({ nome: "", telefone: "", numeroCasa: "", tipoUsuario: "morador" });
+      showFeedback(`Morador cadastrado. Casa ${numeroCasa} usa senha inicial ${defaultTemporaryPassword}.`);
+      Alert.alert("Cadastro criado", `Login criado como ${residentForm.tipoUsuario === "admin" ? "admin" : "usuario comum"}. Numero da casa: ${numeroCasa}. Senha inicial: ${defaultTemporaryPassword}.`);
+    } catch (error) {
+      const message = String(error?.message ?? "");
+      const errorMessage = message.includes("UNIQUE")
+        ? "Ja existe cadastro com esse numero da casa."
+        : message || "Nao foi possivel cadastrar o morador.";
+      Alert.alert("Erro no cadastro", errorMessage);
+    }
+  }
+
+  function openResidentEditor(user) {
+    setEditingResident(user);
+    setEditResidentForm({
+      nome: user.nome,
+      telefone: user.telefone,
+      numeroCasa: user.numeroCasa ?? "",
+      tipoUsuario: user.tipoUsuario === "admin" ? "admin" : "morador",
+      situacao: user.situacao ?? activeStatus
     });
-    setResidentForm({ nome: "", telefone: "", email: "" });
+  }
+
+  async function saveResidentEdit() {
+    const numeroCasa = normalizeHouseNumber(editResidentForm.numeroCasa);
+
+    if (!editingResident || !editResidentForm.nome.trim() || !editResidentForm.telefone.trim() || !numeroCasa) {
+      Alert.alert("Preencha os campos", "Nome, telefone e numero da casa sao obrigatorios.");
+      return;
+    }
+
+    if (state.usuarios.some((user) => user.id !== editingResident.id && user.numeroCasa === numeroCasa)) {
+      Alert.alert("Cadastro duplicado", "Ja existe outro morador com esse numero da casa.");
+      return;
+    }
+
+    if (!database) {
+      Alert.alert("Banco indisponivel", "Tente novamente em alguns segundos.");
+      return;
+    }
+
+    const updatedResident = {
+      ...editingResident,
+      ...editResidentForm,
+      numeroCasa,
+      tipoUsuario: editResidentForm.tipoUsuario === "admin" ? "admin" : "morador",
+      situacao: editResidentForm.situacao ?? activeStatus
+    };
+
+    try {
+      await updateMoradorCadastro(database, editingResident.numeroCasa, updatedResident);
+      await updateMoradorData(database, editingResident.numeroCasa, updatedResident);
+      updateState((draft) => {
+        const index = draft.usuarios.findIndex((user) => user.id === editingResident.id);
+        if (index >= 0) draft.usuarios[index] = updatedResident;
+      });
+      if (editingResident.numeroCasa === authUser?.NUMERO_CASA) {
+        const updatedAuthUser = {
+          ...authUser,
+          NOME: updatedResident.nome,
+          NUMERO_CASA: updatedResident.numeroCasa,
+          TELEFONE: updatedResident.telefone,
+          TIPO_USUARIO: updatedResident.tipoUsuario,
+          SITUACAO: updatedResident.situacao
+        };
+        setAuthUser(updatedAuthUser);
+        setRole(getCadastroRole(updatedAuthUser.TIPO_USUARIO));
+      }
+      setEditingResident(null);
+      showFeedback("Cadastro do morador atualizado.");
+    } catch (error) {
+      Alert.alert("Erro ao editar", error?.message ?? "Nao foi possivel salvar as alteracoes.");
+    }
+  }
+
+  function openPasswordEditor() {
+    if (!editingResident) return;
+    setPasswordEditResident(editingResident);
+    setEditPasswordForm({ senha: "", repetirSenha: "" });
+  }
+
+  async function saveEditedPassword() {
+    const senha = editPasswordForm.senha.trim();
+    const repetirSenha = editPasswordForm.repetirSenha.trim();
+
+    if (!passwordEditResident || !senha || !repetirSenha) {
+      Alert.alert("Preencha os campos", "Digite a nova senha e repita para confirmar.");
+      return;
+    }
+
+    if (senha.length < 4) {
+      Alert.alert("Senha fraca", "Use pelo menos 4 caracteres.");
+      return;
+    }
+
+    if (senha !== repetirSenha) {
+      Alert.alert("Senhas diferentes", "A repeticao precisa ser igual a nova senha.");
+      return;
+    }
+
+    if (!database) {
+      Alert.alert("Banco indisponivel", "Tente novamente em alguns segundos.");
+      return;
+    }
+
+    try {
+      await updateCadastroPassword(database, passwordEditResident.numeroCasa, senha);
+      setPasswordEditResident(null);
+      setEditPasswordForm({ senha: "", repetirSenha: "" });
+      showFeedback("Senha atualizada com sucesso.");
+    } catch (error) {
+      Alert.alert("Erro ao trocar senha", error?.message ?? "Nao foi possivel salvar a nova senha.");
+    }
+  }
+
+  async function toggleResidentStatus() {
+    if (!editingResident) return;
+    if (editingResident.numeroCasa === authUser?.NUMERO_CASA) {
+      Alert.alert("Acao bloqueada", "Voce nao pode inativar a propria conta logada.");
+      return;
+    }
+    if (!database) {
+      Alert.alert("Banco indisponivel", "Tente novamente em alguns segundos.");
+      return;
+    }
+    const nextStatus = (editingResident.situacao ?? activeStatus) === inactiveStatus ? activeStatus : inactiveStatus;
+    showConfirmationAlert({
+      title: `${nextStatus === inactiveStatus ? "Inativar" : "Reativar"} cadastro?`,
+      message: nextStatus === inactiveStatus
+        ? "Este morador nao conseguira entrar no sistema enquanto estiver inativo."
+        : "Este morador voltara a conseguir entrar no sistema.",
+      confirmText: nextStatus === inactiveStatus ? "Inativar" : "Reativar",
+      confirmStyle: nextStatus === inactiveStatus ? "destructive" : "default",
+      onConfirm: () => updateResidentStatus(nextStatus)
+    });
+  }
+
+  async function updateResidentStatus(nextStatus) {
+    if (!editingResident || !database) return;
+    const updatedResident = { ...editingResident, situacao: nextStatus };
+
+    try {
+      await updateMoradorCadastro(database, editingResident.numeroCasa, updatedResident);
+      await updateMoradorData(database, editingResident.numeroCasa, updatedResident);
+      updateState((draft) => {
+        const user = draft.usuarios.find((item) => item.id === editingResident.id);
+        if (user) user.situacao = nextStatus;
+      });
+      setEditingResident(null);
+      showFeedback(`Cadastro ${nextStatus === inactiveStatus ? "inativado" : "reativado"}.`);
+    } catch (error) {
+      Alert.alert("Erro ao alterar situacao", error?.message ?? "Nao foi possivel atualizar o cadastro.");
+    }
+  }
+
+  function confirmDeleteResident() {
+    if (!editingResident) return;
+    if (editingResident.numeroCasa === authUser?.NUMERO_CASA) {
+      Alert.alert("Acao bloqueada", "Voce nao pode excluir a propria conta logada.");
+      return;
+    }
+
+    showConfirmationAlert({
+      title: "Excluir cadastro?",
+      message: "Isso remove o morador, login, residencias, cobrancas, pagamentos e ocorrencias vinculadas.",
+      confirmText: "Excluir",
+      confirmStyle: "destructive",
+      onConfirm: deleteResident
+    });
+  }
+
+  async function deleteResident() {
+    if (!editingResident || !database) return;
+    const residentId = editingResident.id;
+    const numeroCasa = editingResident.numeroCasa;
+
+    try {
+      await deleteMoradorData(database, numeroCasa);
+      await deleteMoradorCadastro(database, numeroCasa);
+      updateState((draft) => {
+        const homeIds = draft.residencias.filter((home) => home.usuarioId === residentId).map((home) => home.id);
+        const chargeIds = draft.cobrancas.filter((charge) => homeIds.includes(charge.residenciaId)).map((charge) => charge.id);
+        draft.pagamentos = draft.pagamentos.filter((payment) => !chargeIds.includes(payment.cobrancaId));
+        draft.cobrancas = draft.cobrancas.filter((charge) => !homeIds.includes(charge.residenciaId));
+        draft.residencias = draft.residencias.filter((home) => home.usuarioId !== residentId);
+        draft.ocorrencias = draft.ocorrencias.filter((issue) => issue.usuarioId !== residentId);
+        draft.usuarios = draft.usuarios.filter((user) => user.id !== residentId);
+      });
+      setEditingResident(null);
+      showFeedback("Cadastro excluido.");
+    } catch (error) {
+      Alert.alert("Erro ao excluir", error?.message ?? "Nao foi possivel excluir o cadastro.");
+    }
   }
 
   function addHome() {
@@ -366,6 +1188,7 @@ export default function App() {
       });
     });
     setHomeForm({ endereco: "", numero: "", observacao: "" });
+    showFeedback("Residencia cadastrada.");
   }
 
   function generateMonthly() {
@@ -373,6 +1196,7 @@ export default function App() {
       Alert.alert("Mes invalido", "Use o formato AAAA-MM, por exemplo 2026-08.");
       return;
     }
+    let createdCount = 0;
     updateState((draft) => {
       draft.residencias.forEach((home) => {
         const exists = draft.cobrancas.some((charge) => charge.residenciaId === home.id && charge.mesReferencia === monthRef);
@@ -385,9 +1209,11 @@ export default function App() {
             dataVencimento: `${monthRef}-10`,
             situacao: "Pendente"
           });
+          createdCount += 1;
         }
       });
     });
+    showFeedback(createdCount ? `${createdCount} mensalidade(s) de ${monthRef} gerada(s).` : `Nenhuma nova mensalidade para ${monthRef}.`, createdCount ? "ok" : "warn");
   }
 
   function payFirstPending() {
@@ -395,6 +1221,16 @@ export default function App() {
       Alert.alert("Tudo certo", "Nao ha cobranca pendente para registrar.");
       return;
     }
+    showConfirmationAlert({
+      title: "Registrar pagamento?",
+      message: `Confirmar pagamento de ${money(firstPending.valor)} para ${helpers.residentNameByHome(firstPending.residenciaId)}?`,
+      confirmText: "Confirmar",
+      onConfirm: confirmPayFirstPending
+    });
+  }
+
+  function confirmPayFirstPending() {
+    if (!firstPending) return;
     updateState((draft) => {
       const charge = draft.cobrancas.find((item) => item.id === firstPending.id);
       charge.situacao = "Pago";
@@ -407,6 +1243,7 @@ export default function App() {
         observacao: "Recebido pelo administrador"
       });
     });
+    showFeedback("Pagamento registrado.");
   }
 
   function addNotice() {
@@ -418,6 +1255,7 @@ export default function App() {
       draft.avisos.push({ id: nextId(draft.avisos), ...noticeForm, dataPublicacao: today() });
     });
     setNoticeForm({ titulo: "", mensagem: "", tipoAviso: "Manutencao" });
+    showFeedback("Aviso publicado.");
   }
 
   function addIssue() {
@@ -436,12 +1274,28 @@ export default function App() {
       });
     });
     setIssueForm({ descricao: "", tipoOcorrencia: "Vazamento" });
+    showFeedback("Ocorrencia registrada.");
   }
 
   function showReceipt(payment) {
     const charge = helpers.getCharge(payment.cobrancaId);
+    if (!charge) {
+      Alert.alert("Comprovante indisponivel", "A cobranca vinculada a este pagamento nao esta mais cadastrada.");
+      return;
+    }
+
     const home = helpers.getHome(charge.residenciaId);
+    if (!home) {
+      Alert.alert("Comprovante indisponivel", "A residencia vinculada a este pagamento nao esta mais cadastrada.");
+      return;
+    }
+
     const resident = helpers.getResident(home.usuarioId);
+    if (!resident) {
+      Alert.alert("Comprovante indisponivel", "O morador vinculado a este pagamento nao esta mais cadastrado.");
+      return;
+    }
+
     setReceipt([
       "AGUA RURAL",
       "Comprovante de pagamento",
@@ -482,12 +1336,26 @@ export default function App() {
   }
 
   if (!authUser) {
+    if (passwordChangeUser) {
+      return (
+        <ChangePasswordScreen
+          authBusy={authBusy}
+          passwordForm={passwordForm}
+          setPasswordForm={setPasswordForm}
+          userName={passwordChangeUser.NOME}
+          onChangePassword={handleChangeTemporaryPassword}
+        />
+      );
+    }
+
     return (
       <LoginScreen
         authBusy={authBusy}
         loginForm={loginForm}
+        rememberedLogin={rememberedLogin}
         onForgotPassword={handleForgotPassword}
         onLogin={handleLogin}
+        onRememberedLogin={handleRememberedLogin}
         setLoginForm={setLoginForm}
       />
     );
@@ -504,21 +1372,10 @@ export default function App() {
           <Text style={styles.title}>Agua Rural</Text>
         </View>
         <View style={styles.headerActions}>
-          {authUser.TIPO_USUARIO === "admin" ? (
-            <View style={styles.roleSwitch}>
-              <TouchableOpacity style={[styles.roleButton, role === "admin" && styles.roleActive]} onPress={() => changeRole("admin")}>
-                <Text style={[styles.roleText, role === "admin" && styles.roleTextActive]}>Admin</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={[styles.roleButton, role === "morador" && styles.roleActive]} onPress={() => changeRole("morador")}>
-                <Text style={[styles.roleText, role === "morador" && styles.roleTextActive]}>Morador</Text>
-              </TouchableOpacity>
-            </View>
-          ) : (
-            <View style={styles.roleChip}>
-              <Text style={styles.roleChipText}>Morador</Text>
-            </View>
-          )}
-          <TouchableOpacity style={styles.logoutButton} onPress={logout}>
+          <View style={styles.accountChip}>
+            <Text style={styles.accountChipText} numberOfLines={1}>{authUser.NOME}</Text>
+          </View>
+          <TouchableOpacity accessibilityRole="button" style={styles.logoutButton} onPress={logout}>
             <Text style={styles.logoutText}>Sair</Text>
           </TouchableOpacity>
         </View>
@@ -527,12 +1384,14 @@ export default function App() {
       <View style={styles.tabs}>
         <ScrollView horizontal showsHorizontalScrollIndicator={false}>
           {visibleTabs.map((tab) => (
-            <TouchableOpacity key={tab.id} style={[styles.tab, activeTab === tab.id && styles.tabActive]} onPress={() => setActiveTab(tab.id)}>
+            <TouchableOpacity accessibilityRole="button" key={tab.id} style={[styles.tab, activeTab === tab.id && styles.tabActive]} onPress={() => setActiveTab(tab.id)}>
               <Text style={[styles.tabText, activeTab === tab.id && styles.tabTextActive]}>{tab.label}</Text>
             </TouchableOpacity>
           ))}
         </ScrollView>
       </View>
+
+      {feedback ? <FeedbackBanner text={feedback.text} tone={feedback.tone} onClose={() => setFeedback(null)} /> : null}
 
       <ScrollView style={styles.content} contentContainerStyle={styles.contentInner}>
         {activeTab === "inicio" && (
@@ -544,7 +1403,7 @@ export default function App() {
               </Text>
             </View>
             <View style={styles.metricGrid}>
-              <Metric label="Arrecadacao" value={money(paidTotal)} />
+              <Metric label="Valor recebido" value={money(paidTotal)} />
               <Metric label="Pendentes" value={pendingCharges.length} />
               <Metric label="Moradores" value={state.usuarios.length} />
               <Metric label="Ocorrencias" value={openIssues.length} />
@@ -562,7 +1421,9 @@ export default function App() {
               )) : <Empty text="Nenhuma cobranca em atraso." />}
             </Section>
             <Section title="Avisos recentes">
-              {state.avisos.slice().reverse().slice(0, 2).map((notice) => <Notice key={notice.id} notice={notice} />)}
+              {state.avisos.length
+                ? state.avisos.slice().reverse().slice(0, 2).map((notice) => <Notice key={notice.id} notice={notice} />)
+                : <Empty text="Nenhum aviso publicado." />}
             </Section>
           </>
         )}
@@ -571,16 +1432,47 @@ export default function App() {
           <>
             {role === "admin" && (
               <Section title="Novo morador">
-                <Field placeholder="Nome" value={residentForm.nome} onChangeText={(nome) => setResidentForm({ ...residentForm, nome })} />
-                <Field placeholder="Telefone" value={residentForm.telefone} onChangeText={(telefone) => setResidentForm({ ...residentForm, telefone })} keyboardType="phone-pad" />
-                <Field placeholder="E-mail" value={residentForm.email} onChangeText={(email) => setResidentForm({ ...residentForm, email })} keyboardType="email-address" />
+                <Field label="Nome" placeholder="Nome do morador" value={residentForm.nome} onChangeText={(nome) => setResidentForm({ ...residentForm, nome })} />
+                <Field label="Telefone" helperText="O telefone e formatado automaticamente." placeholder="(00) 00000-0000" value={residentForm.telefone} onChangeText={(telefone) => setResidentForm({ ...residentForm, telefone: formatPhone(telefone) })} keyboardType="phone-pad" maxLength={15} />
+                <Field label="Numero da casa" helperText="Use somente numeros. Este numero sera usado no login." placeholder="Ex: 12" value={residentForm.numeroCasa} onChangeText={(numeroCasa) => setResidentForm({ ...residentForm, numeroCasa: onlyDigits(numeroCasa) })} keyboardType="number-pad" />
+                <View style={styles.rolePicker}>
+                  <Text style={styles.rolePickerLabel}>Tipo de acesso</Text>
+                  <View style={styles.rolePickerOptions}>
+                    <TouchableOpacity
+                      style={[styles.roleOption, residentForm.tipoUsuario === "morador" && styles.roleOptionActive]}
+                      onPress={() => setResidentForm({ ...residentForm, tipoUsuario: "morador" })}
+                    >
+                      <Text style={[styles.roleOptionText, residentForm.tipoUsuario === "morador" && styles.roleOptionTextActive]}>Usuario comum</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[styles.roleOption, residentForm.tipoUsuario === "admin" && styles.roleOptionActive]}
+                      onPress={() => setResidentForm({ ...residentForm, tipoUsuario: "admin" })}
+                    >
+                      <Text style={[styles.roleOptionText, residentForm.tipoUsuario === "admin" && styles.roleOptionTextActive]}>Administrador</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+                <Text style={styles.formHint}>Senha inicial: {defaultTemporaryPassword}. No primeiro login o morador precisara trocar a senha.</Text>
                 <PrimaryButton label="Cadastrar morador" onPress={addResident} />
               </Section>
             )}
             <Section title="Moradores cadastrados" subtitle={`${state.usuarios.length} registros`}>
-              {state.usuarios.map((user) => <ListItem key={user.id} title={user.nome} subtitle={`${user.telefone}\n${user.email || "Sem e-mail"}`} />)}
+              {state.usuarios.length ? state.usuarios.map((user) => (
+                <ListItem
+                  key={user.id}
+                  title={user.nome}
+                  subtitle={`Casa ${user.numeroCasa ?? "nao informada"}\n${user.telefone}`}
+                  status={user.situacao === inactiveStatus ? inactiveStatus : user.tipoUsuario === "admin" ? "Administrador" : "Usuario comum"}
+                  statusStyle={user.situacao === inactiveStatus ? "danger" : user.tipoUsuario === "admin" ? "ok" : "warn"}
+                  action={role === "admin" ? (
+                    <TouchableOpacity accessibilityLabel={`Editar ${user.nome}`} accessibilityRole="button" style={styles.editIconButton} onPress={() => openResidentEditor(user)}>
+                      <Text style={styles.editIconText}>Editar</Text>
+                    </TouchableOpacity>
+                  ) : null}
+                />
+              )) : <Empty text="Nenhum morador cadastrado." />}
             </Section>
-            {role === "admin" && (
+            {/* {role === "admin" && (
               <Section title="Nova residencia" subtitle={firstResident ? `Vinculada a ${firstResident.nome}` : "Cadastre um morador"}>
                 <Field placeholder="Endereco" value={homeForm.endereco} onChangeText={(endereco) => setHomeForm({ ...homeForm, endereco })} />
                 <Field placeholder="Numero" value={homeForm.numero} onChangeText={(numero) => setHomeForm({ ...homeForm, numero })} />
@@ -588,6 +1480,8 @@ export default function App() {
                 <PrimaryButton label="Cadastrar residencia" onPress={addHome} />
               </Section>
             )}
+            BLOCO DESATIVADO DEVIDO A NÃO TER NECESSIDADE POR MOMENTO
+            */}
           </>
         )}
 
@@ -595,12 +1489,12 @@ export default function App() {
           <>
             {role === "admin" && (
               <Section title="Gerar mensalidades" subtitle="Valor padrao R$ 30,00">
-                <Field placeholder="AAAA-MM" value={monthRef} onChangeText={setMonthRef} />
+            <Field label="Mes de referencia" helperText="Formato AAAA-MM, por exemplo 2026-08." placeholder="AAAA-MM" value={monthRef} onChangeText={setMonthRef} />
                 <PrimaryButton label="Gerar para todas as residencias" onPress={generateMonthly} />
               </Section>
             )}
             <Section title="Mensalidades">
-              {state.cobrancas.map((charge) => (
+              {state.cobrancas.length ? state.cobrancas.map((charge) => (
                 <ListItem
                   key={charge.id}
                   title={helpers.residentNameByHome(charge.residenciaId)}
@@ -609,7 +1503,7 @@ export default function App() {
                   status={charge.situacao === "Pago" ? "Pago" : charge.dataVencimento < today() ? "Em atraso" : "Pendente"}
                   statusStyle={charge.situacao === "Pago" ? "ok" : charge.dataVencimento < today() ? "danger" : "warn"}
                 />
-              ))}
+              )) : <Empty text="Nenhuma mensalidade gerada." />}
             </Section>
           </>
         )}
@@ -622,7 +1516,7 @@ export default function App() {
               </Section>
             )}
             <Section title="Historico de pagamentos" subtitle={`${state.pagamentos.length} pagos`}>
-              {state.pagamentos.map((payment) => {
+              {state.pagamentos.length ? state.pagamentos.map((payment) => {
                 const charge = helpers.getCharge(payment.cobrancaId);
                 return (
                   <ListItem
@@ -633,7 +1527,7 @@ export default function App() {
                     onPress={() => showReceipt(payment)}
                   />
                 );
-              })}
+              }) : <Empty text="Nenhum pagamento registrado." />}
             </Section>
           </>
         )}
@@ -642,14 +1536,16 @@ export default function App() {
           <>
             {role === "admin" && (
               <Section title="Novo aviso">
-                <Field placeholder="Titulo" value={noticeForm.titulo} onChangeText={(titulo) => setNoticeForm({ ...noticeForm, titulo })} />
-                <Field placeholder="Tipo de aviso" value={noticeForm.tipoAviso} onChangeText={(tipoAviso) => setNoticeForm({ ...noticeForm, tipoAviso })} />
-                <Field placeholder="Mensagem" value={noticeForm.mensagem} onChangeText={(mensagem) => setNoticeForm({ ...noticeForm, mensagem })} multiline />
+                <Field label="Titulo" placeholder="Titulo do aviso" value={noticeForm.titulo} onChangeText={(titulo) => setNoticeForm({ ...noticeForm, titulo })} />
+                <Field label="Tipo de aviso" placeholder="Ex: Manutencao" value={noticeForm.tipoAviso} onChangeText={(tipoAviso) => setNoticeForm({ ...noticeForm, tipoAviso })} />
+                <Field label="Mensagem" placeholder="Escreva o comunicado" value={noticeForm.mensagem} onChangeText={(mensagem) => setNoticeForm({ ...noticeForm, mensagem })} multiline />
                 <PrimaryButton label="Publicar aviso" onPress={addNotice} />
               </Section>
             )}
             <Section title="Comunicados">
-              {state.avisos.slice().reverse().map((notice) => <Notice key={notice.id} notice={notice} />)}
+              {state.avisos.length
+                ? state.avisos.slice().reverse().map((notice) => <Notice key={notice.id} notice={notice} />)
+                : <Empty text="Nenhum comunicado publicado." />}
             </Section>
           </>
         )}
@@ -657,12 +1553,12 @@ export default function App() {
         {activeTab === "ocorrencias" && (
           <>
             <Section title="Informar problema" subtitle={firstResident ? `Como ${firstResident.nome}` : "Cadastre um morador"}>
-              <Field placeholder="Tipo de ocorrencia" value={issueForm.tipoOcorrencia} onChangeText={(tipoOcorrencia) => setIssueForm({ ...issueForm, tipoOcorrencia })} />
-              <Field placeholder="Descricao" value={issueForm.descricao} onChangeText={(descricao) => setIssueForm({ ...issueForm, descricao })} multiline />
+              <Field label="Tipo de ocorrencia" placeholder="Ex: Vazamento" value={issueForm.tipoOcorrencia} onChangeText={(tipoOcorrencia) => setIssueForm({ ...issueForm, tipoOcorrencia })} />
+              <Field label="Descricao" placeholder="Descreva o problema encontrado" value={issueForm.descricao} onChangeText={(descricao) => setIssueForm({ ...issueForm, descricao })} multiline />
               <PrimaryButton label="Registrar ocorrencia" onPress={addIssue} />
             </Section>
             <Section title="Historico da rede">
-              {state.ocorrencias.map((issue) => (
+              {state.ocorrencias.length ? state.ocorrencias.map((issue) => (
                 <ListItem
                   key={issue.id}
                   title={issue.tipoOcorrencia}
@@ -670,7 +1566,7 @@ export default function App() {
                   status={issue.situacao}
                   statusStyle="ok"
                 />
-              ))}
+              )) : <Empty text="Nenhuma ocorrencia registrada." />}
             </Section>
           </>
         )}
@@ -687,6 +1583,72 @@ export default function App() {
           </View>
         </View>
       </Modal>
+
+      <Modal visible={Boolean(editingResident)} transparent animationType="fade" onRequestClose={() => setEditingResident(null)}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modal}>
+            <Text style={styles.modalTitle}>Editar morador</Text>
+            <Field label="Nome" placeholder="Nome do morador" value={editResidentForm.nome} onChangeText={(nome) => setEditResidentForm({ ...editResidentForm, nome })} />
+            <Field label="Telefone" placeholder="(00) 00000-0000" value={editResidentForm.telefone} onChangeText={(telefone) => setEditResidentForm({ ...editResidentForm, telefone: formatPhone(telefone) })} keyboardType="phone-pad" maxLength={15} />
+            <Field label="Numero da casa" helperText="Use somente numeros. Alterar este numero muda o login do morador." placeholder="Ex: 12" value={editResidentForm.numeroCasa} onChangeText={(numeroCasa) => setEditResidentForm({ ...editResidentForm, numeroCasa: onlyDigits(numeroCasa) })} keyboardType="number-pad" />
+            <View style={styles.rolePicker}>
+              <Text style={styles.rolePickerLabel}>Tipo de acesso</Text>
+              <View style={styles.rolePickerOptions}>
+                <TouchableOpacity
+                  style={[styles.roleOption, editResidentForm.tipoUsuario === "morador" && styles.roleOptionActive]}
+                  onPress={() => setEditResidentForm({ ...editResidentForm, tipoUsuario: "morador" })}
+                >
+                  <Text style={[styles.roleOptionText, editResidentForm.tipoUsuario === "morador" && styles.roleOptionTextActive]}>Usuario comum</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.roleOption, editResidentForm.tipoUsuario === "admin" && styles.roleOptionActive]}
+                  onPress={() => setEditResidentForm({ ...editResidentForm, tipoUsuario: "admin" })}
+                >
+                  <Text style={[styles.roleOptionText, editResidentForm.tipoUsuario === "admin" && styles.roleOptionTextActive]}>Administrador</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+            <PrimaryButton label="Salvar alteracoes" onPress={saveResidentEdit} />
+            <SecondaryButton label="Trocar senha" onPress={openPasswordEditor} />
+            <SecondaryButton label={(editingResident?.situacao ?? activeStatus) === inactiveStatus ? "Reativar cadastro" : "Inativar cadastro"} onPress={toggleResidentStatus} />
+            <TouchableOpacity accessibilityRole="button" style={styles.dangerButton} onPress={confirmDeleteResident}>
+              <Text style={styles.dangerButtonText}>Excluir cadastro</Text>
+            </TouchableOpacity>
+            <SecondaryButton label="Cancelar" onPress={() => setEditingResident(null)} />
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={Boolean(passwordEditResident)} transparent animationType="fade" onRequestClose={() => setPasswordEditResident(null)}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modal}>
+            <Text style={styles.modalTitle}>Trocar senha</Text>
+            <Text style={styles.loginSubtitle}>{passwordEditResident?.nome}</Text>
+            <Field
+              label="Nova senha"
+              helperText="Use pelo menos 4 caracteres. Letras e numeros sao permitidos."
+              autoCapitalize="none"
+              autoCorrect={false}
+              placeholder="Nova senha"
+              secureTextEntry
+              value={editPasswordForm.senha}
+              onChangeText={(senha) => setEditPasswordForm({ ...editPasswordForm, senha })}
+            />
+            <Field
+              label="Repetir senha"
+              autoCapitalize="none"
+              autoCorrect={false}
+              placeholder="Repetir senha"
+              secureTextEntry
+              value={editPasswordForm.repetirSenha}
+              onChangeText={(repetirSenha) => setEditPasswordForm({ ...editPasswordForm, repetirSenha })}
+              onSubmitEditing={saveEditedPassword}
+            />
+            <PrimaryButton label="Salvar senha" onPress={saveEditedPassword} />
+            <SecondaryButton label="Cancelar" onPress={() => setPasswordEditResident(null)} />
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -694,8 +1656,10 @@ export default function App() {
 function LoginScreen({
   authBusy,
   loginForm,
+  rememberedLogin,
   onForgotPassword,
   onLogin,
+  onRememberedLogin,
   setLoginForm
 }) {
   return (
@@ -708,27 +1672,83 @@ function LoginScreen({
           <Text style={styles.loginSubtitle}>Entrar no sistema</Text>
 
           <Field
+            label="Numero da casa"
+            helperText="Digite somente os numeros da casa cadastrada."
             autoCapitalize="none"
             autoCorrect={false}
             keyboardType="number-pad"
-            placeholder="Numero da casa"
+            placeholder="N. da casa"
             returnKeyType="next"
             value={loginForm.numeroCasa}
             onChangeText={(numeroCasa) => setLoginForm({ ...loginForm, numeroCasa: onlyDigits(numeroCasa) })}
           />
           <Field
-            keyboardType="number-pad"
-            placeholder="Senha"
+            label="Senha"
+            autoCapitalize="none"
+            autoCorrect={false}
+            placeholder="Digite sua senha"
             returnKeyType="done"
             secureTextEntry
             value={loginForm.senha}
-            onChangeText={(senha) => setLoginForm({ ...loginForm, senha: onlyDigits(senha) })}
+            onChangeText={(senha) => setLoginForm({ ...loginForm, senha })}
             onSubmitEditing={onLogin}
           />
           <PrimaryButton disabled={authBusy} label={authBusy ? "Entrando..." : "Entrar"} onPress={onLogin} />
-          <TouchableOpacity style={styles.forgotButton} onPress={onForgotPassword}>
+          {rememberedLogin ? (
+            <SecondaryButton
+              label={`Entrar como casa ${rememberedLogin.numeroCasa}`}
+              onPress={onRememberedLogin}
+            />
+          ) : null}
+          <TouchableOpacity accessibilityRole="button" style={styles.forgotButton} onPress={onForgotPassword}>
             <Text style={styles.forgotText}>Esqueci minha senha</Text>
           </TouchableOpacity>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+function ChangePasswordScreen({
+  authBusy,
+  onChangePassword,
+  passwordForm,
+  setPasswordForm,
+  userName
+}) {
+  return (
+    <SafeAreaView style={styles.loginSafe}>
+      <StatusBar barStyle="light-content" backgroundColor="#14322d" />
+      <ScrollView contentContainerStyle={styles.loginScroll} keyboardShouldPersistTaps="handled">
+        <View style={styles.loginPanel}>
+          <Text style={styles.loginKicker}>Primeiro acesso</Text>
+          <Text style={styles.loginTitle}>Trocar senha</Text>
+          <Text style={styles.loginSubtitle}>{userName}, crie uma senha nova para continuar.</Text>
+
+          <Field
+            label="Nova senha"
+            helperText="Use pelo menos 4 caracteres. Letras e numeros sao permitidos."
+            autoCapitalize="none"
+            autoCorrect={false}
+            placeholder="Nova senha"
+            placeholder="N. da casa"
+            returnKeyType="next"
+            secureTextEntry
+            value={passwordForm.senha}
+            onChangeText={(senha) => setPasswordForm({ ...passwordForm, senha })}
+          />
+          <Field
+            label="Repetir senha"
+            autoCapitalize="none"
+            autoCorrect={false}
+            placeholder="Repetir senha"
+            returnKeyType="done"
+            secureTextEntry
+            value={passwordForm.repetirSenha}
+            onChangeText={(repetirSenha) => setPasswordForm({ ...passwordForm, repetirSenha })}
+            onSubmitEditing={onChangePassword}
+          />
+          <PrimaryButton disabled={authBusy} label={authBusy ? "Salvando..." : "Salvar nova senha"} onPress={onChangePassword} />
         </View>
       </ScrollView>
     </SafeAreaView>
@@ -756,28 +1776,54 @@ function Section({ title, subtitle, children }) {
   );
 }
 
-function Field(props) {
-  return <TextInput {...props} placeholderTextColor="#7a8783" style={[styles.input, props.multiline && styles.textarea]} />;
+function Field({ helperText, label, style, ...props }) {
+  return (
+    <View style={styles.fieldGroup}>
+      {label ? <Text style={styles.fieldLabel}>{label}</Text> : null}
+      <TextInput
+        {...props}
+        accessibilityLabel={props.accessibilityLabel ?? label ?? props.placeholder}
+        placeholderTextColor="#7a8783"
+        style={[styles.input, props.multiline && styles.textarea, style]}
+      />
+      {helperText ? <Text style={styles.fieldHelp}>{helperText}</Text> : null}
+    </View>
+  );
 }
 
 function PrimaryButton({ disabled, label, onPress }) {
   return (
-    <TouchableOpacity disabled={disabled} style={[styles.primaryButton, disabled && styles.buttonDisabled]} onPress={onPress}>
+    <TouchableOpacity accessibilityRole="button" disabled={disabled} style={[styles.primaryButton, disabled && styles.buttonDisabled]} onPress={onPress}>
       <Text style={styles.primaryButtonText}>{label}</Text>
     </TouchableOpacity>
   );
 }
 
-function SecondaryButton({ label, onPress }) {
+function SecondaryButton({ disabled, label, onPress }) {
   return (
-    <TouchableOpacity style={styles.secondaryButton} onPress={onPress}>
+    <TouchableOpacity accessibilityRole="button" disabled={disabled} style={[styles.secondaryButton, disabled && styles.buttonDisabled]} onPress={onPress}>
       <Text style={styles.secondaryButtonText}>{label}</Text>
     </TouchableOpacity>
   );
 }
 
 function Empty({ text }) {
-  return <Text style={styles.empty}>{text}</Text>;
+  return (
+    <View style={styles.emptyBox}>
+      <Text style={styles.empty}>{text}</Text>
+    </View>
+  );
+}
+
+function FeedbackBanner({ onClose, text, tone }) {
+  return (
+    <View style={[styles.feedbackBanner, tone === "warn" && styles.feedbackWarn]}>
+      <Text style={styles.feedbackText}>{text}</Text>
+      <TouchableOpacity accessibilityLabel="Fechar aviso" style={styles.feedbackClose} onPress={onClose}>
+        <Text style={styles.feedbackCloseText}>Fechar</Text>
+      </TouchableOpacity>
+    </View>
+  );
 }
 
 function Notice({ notice }) {
@@ -790,7 +1836,7 @@ function Notice({ notice }) {
   );
 }
 
-function ListItem({ title, subtitle, right, status, statusStyle, onPress }) {
+function ListItem({ action, title, subtitle, right, status, statusStyle, onPress }) {
   const content = (
     <View style={styles.listItem}>
       <View style={styles.listText}>
@@ -800,6 +1846,7 @@ function ListItem({ title, subtitle, right, status, statusStyle, onPress }) {
       <View style={styles.listRight}>
         {right ? <Text style={styles.rightText}>{right}</Text> : null}
         {status ? <Text style={[styles.badge, styles[statusStyle]]}>{status}</Text> : null}
+        {action}
       </View>
     </View>
   );
@@ -915,35 +1962,15 @@ const styles = StyleSheet.create({
     fontSize: 26,
     fontWeight: "900"
   },
-  roleSwitch: {
-    flexDirection: "row",
-    backgroundColor: "rgba(255,255,255,0.12)",
-    borderRadius: 8,
-    padding: 4
-  },
-  roleButton: {
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    borderRadius: 7
-  },
-  roleActive: {
-    backgroundColor: "#ffffff"
-  },
-  roleText: {
-    color: "#ffffff",
-    fontWeight: "800"
-  },
-  roleTextActive: {
-    color: "#14322d"
-  },
-  roleChip: {
+  accountChip: {
     minHeight: 42,
+    maxWidth: 160,
     borderRadius: 8,
     justifyContent: "center",
     backgroundColor: "rgba(255,255,255,0.12)",
     paddingHorizontal: 12
   },
-  roleChipText: {
+  accountChipText: {
     color: "#ffffff",
     fontWeight: "900"
   },
@@ -980,6 +2007,39 @@ const styles = StyleSheet.create({
   },
   tabTextActive: {
     color: "#14322d"
+  },
+  feedbackBanner: {
+    backgroundColor: "#e6f5ed",
+    borderBottomColor: "#badfca",
+    borderBottomWidth: 1,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10
+  },
+  feedbackWarn: {
+    backgroundColor: "#fff2df",
+    borderBottomColor: "#f2d4a5"
+  },
+  feedbackText: {
+    flex: 1,
+    color: "#163b2a",
+    fontWeight: "800",
+    lineHeight: 19
+  },
+  feedbackClose: {
+    minHeight: 34,
+    borderRadius: 8,
+    borderColor: "rgba(20,50,45,0.18)",
+    borderWidth: 1,
+    justifyContent: "center",
+    paddingHorizontal: 10
+  },
+  feedbackCloseText: {
+    color: "#14322d",
+    fontWeight: "900"
   },
   content: {
     flex: 1,
@@ -1056,6 +2116,19 @@ const styles = StyleSheet.create({
     padding: 12,
     gap: 10
   },
+  fieldGroup: {
+    gap: 6
+  },
+  fieldLabel: {
+    color: "#42514c",
+    fontSize: 12,
+    fontWeight: "900"
+  },
+  fieldHelp: {
+    color: "#66736f",
+    fontSize: 12,
+    lineHeight: 17
+  },
   input: {
     minHeight: 46,
     borderColor: "#d8e3df",
@@ -1069,6 +2142,51 @@ const styles = StyleSheet.create({
     minHeight: 88,
     textAlignVertical: "top",
     paddingTop: 12
+  },
+  rolePicker: {
+    gap: 8
+  },
+  rolePickerLabel: {
+    color: "#66736f",
+    fontSize: 12,
+    fontWeight: "800"
+  },
+  rolePickerOptions: {
+    flexDirection: "row",
+    gap: 8
+  },
+  roleOption: {
+    flex: 1,
+    minHeight: 42,
+    borderColor: "#d8e3df",
+    borderWidth: 1,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#f7fbf9",
+    paddingHorizontal: 10
+  },
+  roleOptionActive: {
+    backgroundColor: "#146c5f",
+    borderColor: "#146c5f"
+  },
+  roleOptionText: {
+    color: "#42514c",
+    fontWeight: "900"
+  },
+  roleOptionTextActive: {
+    color: "#ffffff"
+  },
+  formHint: {
+    color: "#42514c",
+    backgroundColor: "#eef4f1",
+    borderColor: "#d8e3df",
+    borderWidth: 1,
+    borderRadius: 8,
+    fontSize: 12,
+    fontWeight: "800",
+    lineHeight: 18,
+    padding: 10
   },
   primaryButton: {
     minHeight: 46,
@@ -1100,6 +2218,18 @@ const styles = StyleSheet.create({
     color: "#16201d",
     fontWeight: "900"
   },
+  dangerButton: {
+    minHeight: 46,
+    borderRadius: 8,
+    backgroundColor: "#b95032",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 14
+  },
+  dangerButtonText: {
+    color: "#ffffff",
+    fontWeight: "900"
+  },
   listItem: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -1123,6 +2253,20 @@ const styles = StyleSheet.create({
   listRight: {
     alignItems: "flex-end",
     gap: 7
+  },
+  editIconButton: {
+    minWidth: 58,
+    height: 34,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#146c5f",
+    paddingHorizontal: 10
+  },
+  editIconText: {
+    color: "#ffffff",
+    fontSize: 12,
+    fontWeight: "900"
   },
   rightText: {
     color: "#16201d",
@@ -1170,9 +2314,16 @@ const styles = StyleSheet.create({
     color: "#34403c",
     lineHeight: 20
   },
+  emptyBox: {
+    borderColor: "#d8e3df",
+    borderWidth: 1,
+    borderRadius: 8,
+    backgroundColor: "#f7fbf9",
+    padding: 12
+  },
   empty: {
     color: "#66736f",
-    paddingVertical: 8
+    lineHeight: 20
   },
   modalOverlay: {
     flex: 1,

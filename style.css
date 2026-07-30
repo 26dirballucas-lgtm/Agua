@@ -89,8 +89,7 @@ button {
   gap: 8px;
 }
 
-.nav-item,
-.role-button {
+.nav-item {
   border: 0;
   border-radius: 8px;
   background: transparent;
@@ -114,22 +113,10 @@ button {
   border-radius: 8px;
 }
 
-.role-switch {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 6px;
-  margin-top: 10px;
-}
-
-.role-button {
-  padding: 9px 10px;
-  background: rgba(255, 255, 255, 0.08);
-}
-
-.role-button.active {
-  background: #ffffff;
-  color: #14322d;
-  font-weight: 700;
+.profile-card strong {
+  display: block;
+  margin-top: 8px;
+  color: #ffffff;
 }
 
 .main {

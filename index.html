@@ -29,10 +29,7 @@
 
         <div class="profile-card">
           <span class="profile-label">Perfil</span>
-          <div class="role-switch" role="group" aria-label="Tipo de usuario">
-            <button class="role-button active" data-role="admin">Admin</button>
-            <button class="role-button" data-role="morador">Morador</button>
-          </div>
+          <strong id="profile-role">Cargo do cadastro</strong>
         </div>
       </aside>
 
@@ -125,8 +122,8 @@
                 <input name="telefone" required placeholder="(00) 00000-0000" />
               </label>
               <label>
-                E-mail
-                <input name="email" type="email" placeholder="email@exemplo.com" />
+                Numero da casa
+                <input name="numeroCasa" required inputmode="numeric" pattern="[0-9]*" placeholder="01" />
               </label>
               <button class="primary-button" type="submit">Cadastrar</button>
             </form>
@@ -136,7 +133,7 @@
                   <tr>
                     <th>Nome</th>
                     <th>Telefone</th>
-                    <th>E-mail</th>
+                    <th>Numero da casa</th>
                   </tr>
                 </thead>
                 <tbody id="resident-table"></tbody>
