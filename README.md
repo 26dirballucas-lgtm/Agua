@@ -91,9 +91,4 @@ CREATE TABLE IF NOT EXISTS T000_CADASTROS (
 - Ajuda a reconhecer e corrigir erros: mensagens de erro explicam o que falta preencher ou o que esta invalido.
 - Ajuda e documentacao: este README descreve login, banco local e regras principais do sistema.
 
-## Versao web antiga
-
-Os arquivos `index.html` e `style.css` continuam na pasta como prototipo web inicial, mas o app principal agora e o `app.js` do Expo.
-
-
 npx expo start --tunnel --clear
