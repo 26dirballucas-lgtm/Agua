@@ -8,6 +8,7 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
+    "password-reset:server": "node server/whatsapp-reset-server.js",
     "db:reset": "python scripts/build_database.py",
     "db:inspect": "python scripts/inspect_database.py"
   },
@@ -16,10 +17,12 @@
     "expo": "~54.0.36",
     "expo-local-authentication": "~17.0.8",
     "expo-sqlite": "~16.0.10",
+    "qrcode-terminal": "^0.12.0",
     "react": "19.1.0",
     "react-dom": "19.1.0",
     "react-native": "0.81.5",
-    "react-native-web": "^0.21.0"
+    "react-native-web": "^0.21.0",
+    "whatsapp-web.js": "^1.34.7"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",
